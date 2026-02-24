@@ -42,76 +42,83 @@ function makeShaderCode(size: number, stage: 'compute' | 'vertex' | 'fragment'):
   }
 }
 
-g.test('pipeline_creation_immediate_size_mismatch')
+/**
+ * Describes the shader's immediate data size relative to the pipeline layout's immediateSize.
+ * 'none' through 'larger' are compared against the fixed layout size (kFixedLayoutSize).
+ * 'atLimit' and 'exceedLimit' are compared against the device's maxImmediateSize
+ * and use 'auto' layout.
+ */
+type ShaderVsLayoutSize =
+  | 'none'
+  | 'smaller'
+  | 'equal'
+  | 'larger_small'
+  | 'larger'
+  | 'atLimit' // shader size == maxImmediateSize (auto layout)
+  | 'exceedLimit'; // shader size > maxImmediateSize (auto layout)
+
+/** Fixed layout size used for numeric (non-limit) test cases. */
+const kFixedLayoutSize = 16;
+
+/** Resolve a shader-vs-layout size category to an actual byte size. */
+function resolveShaderSize(category: ShaderVsLayoutSize, maxImmediateSize: number): number {
+  switch (category) {
+    case 'none':
+      return 0;
+    case 'smaller':
+      return kFixedLayoutSize - 4;
+    case 'equal':
+      return kFixedLayoutSize;
+    case 'larger_small':
+      return kFixedLayoutSize + 4;
+    case 'larger':
+      return kFixedLayoutSize * 2;
+    // The following compare against the device's maxImmediateSize, not the fixed layout size.
+    case 'atLimit':
+      return maxImmediateSize;
+    case 'exceedLimit':
+      return maxImmediateSize + 4;
+  }
+}
+
+/** Whether a shader-vs-layout category requires an 'auto' pipeline layout. */
+function usesAutoLayout(category: ShaderVsLayoutSize): boolean {
+  return category === 'atLimit' || category === 'exceedLimit';
+}
+
+g.test('pipeline_creation_immediate_size_mismatch,compute')
   .desc(
     `
-    Validate that creating a compute or render pipeline fails if the shader uses
+    Validate that creating a compute pipeline fails if the shader uses
     immediate data larger than the immediateSize specified in the pipeline layout,
     or larger than maxImmediateSize if layout is 'auto'.
     Also validates that using less or equal size is allowed.
-
-    For compute pipelines, stageASize is the compute stage size (stageBSize is unused).
-    For render pipelines, stageASize is the vertex stage size and stageBSize is the
-    fragment stage size.
     `
   )
   .params(u =>
-    u
-      .combine('pipelineType', ['compute', 'render'] as const)
-      .combine('isAsync', [true, false])
-      .combineWithParams([
-        { stageASize: 16, stageBSize: 16, layoutSize: 16 }, // Equal
-        { stageASize: 12, stageBSize: 12, layoutSize: 16 }, // Shader smaller
-        { stageASize: 20, stageBSize: 20, layoutSize: 16 }, // Shader larger (small diff)
-        { stageASize: 32, stageBSize: 32, layoutSize: 16 }, // Shader larger
-        { stageASize: 'max', stageBSize: 0, layoutSize: 'auto' }, // StageA at limit
-        { stageASize: 0, stageBSize: 'max', layoutSize: 'auto' }, // StageB at limit
-        { stageASize: 'max', stageBSize: 'max', layoutSize: 'auto' }, // Both at limit
-        { stageASize: 'exceedLimits', stageBSize: 0, layoutSize: 'auto' }, // StageA exceeds
-        { stageASize: 0, stageBSize: 'exceedLimits', layoutSize: 'auto' }, // StageB exceeds
-      ] as const)
-      .filter(p => {
-        // Compute has a single stage.
-        // For numeric cases (stageBSize === stageASize), keep them — stageBSize is ignored.
-        // For max-limit cases, keep only those where stageBSize is 0.
-        if (p.pipelineType === 'compute') {
-          if (typeof p.stageASize === 'string' || typeof p.stageBSize === 'string') {
-            return p.stageBSize === 0;
-          }
-          return p.stageBSize === p.stageASize;
-        }
-        return true;
-      })
+    u.combine('isAsync', [true, false]).combine('shaderSizeVsLayout', [
+      'smaller',
+      'equal',
+      'larger_small',
+      'larger',
+      'atLimit', // shader size == maxImmediateSize (compared to device limit)
+      'exceedLimit', // shader size > maxImmediateSize (compared to device limit)
+    ] as const)
   )
   .fn(t => {
     t.skipIf(!supportsImmediateData(getGPU(t.rec)), 'Immediate data not supported');
 
-    const { pipelineType, isAsync, stageASize, stageBSize, layoutSize } = t.params;
-
+    const { isAsync, shaderSizeVsLayout } = t.params;
     const maxImmediateSize = t.device.limits.maxImmediateSize;
     assert(maxImmediateSize !== undefined);
 
-    const resolveSize = (sizeDescriptor: number | string): number => {
-      if (typeof sizeDescriptor === 'number') return sizeDescriptor;
-      if (sizeDescriptor === 'max') return maxImmediateSize;
-      if (sizeDescriptor === 'exceedLimits') return maxImmediateSize + 4;
-      return 0;
-    };
+    const resolvedSize = resolveShaderSize(shaderSizeVsLayout, maxImmediateSize);
 
-    const resolvedStageASize = resolveSize(stageASize);
-    const resolvedStageBSize = resolveSize(stageBSize);
-
-    // Ensure the test's fixed sizes fit within the device limit.
-    if (stageASize !== 'exceedLimits') {
+    // Validate non-exceeding sizes fit within device limits.
+    if (shaderSizeVsLayout !== 'exceedLimit') {
       assert(
-        resolvedStageASize <= maxImmediateSize,
-        `stageASize (${resolvedStageASize}) must be <= maxImmediateSize (${maxImmediateSize})`
-      );
-    }
-    if (stageBSize !== 'exceedLimits') {
-      assert(
-        resolvedStageBSize <= maxImmediateSize,
-        `stageBSize (${resolvedStageBSize}) must be <= maxImmediateSize (${maxImmediateSize})`
+        resolvedSize <= maxImmediateSize,
+        `shader size (${resolvedSize}) must be <= maxImmediateSize (${maxImmediateSize})`
       );
     }
 
@@ -119,39 +126,104 @@ g.test('pipeline_creation_immediate_size_mismatch')
     let layout: GPUPipelineLayout | 'auto';
     let validSize: number;
 
-    if (layoutSize === 'auto') {
+    if (usesAutoLayout(shaderSizeVsLayout)) {
       layout = 'auto';
       validSize = maxImmediateSize;
     } else {
       layout = t.device.createPipelineLayout({
         bindGroupLayouts: [],
-        immediateSize: layoutSize as number,
+        immediateSize: kFixedLayoutSize,
       });
-      validSize = layoutSize as number;
+      validSize = kFixedLayoutSize;
     }
 
-    const stageAExceedsLimit = resolvedStageASize > validSize;
-    const stageBExceedsLimit = resolvedStageBSize > validSize;
-    const shouldError = stageAExceedsLimit || stageBExceedsLimit;
+    const shouldError = resolvedSize > validSize;
+    const code = makeShaderCode(resolvedSize, 'compute');
 
-    if (pipelineType === 'compute') {
-      const code = makeShaderCode(resolvedStageASize, 'compute');
+    vtu.doCreateComputePipelineTest(t, isAsync, !shouldError, {
+      layout,
+      compute: { module: t.device.createShaderModule({ code }) },
+    });
+  });
 
-      vtu.doCreateComputePipelineTest(t, isAsync, !shouldError, {
-        layout,
-        compute: { module: t.device.createShaderModule({ code }) },
-      });
+g.test('pipeline_creation_immediate_size_mismatch,render')
+  .desc(
+    `
+    Validate that creating a render pipeline fails if the shader uses
+    immediate data larger than the immediateSize specified in the pipeline layout,
+    or larger than maxImmediateSize if layout is 'auto'.
+    Tests vertex and fragment stages independently.
+    `
+  )
+  .params(u =>
+    u.combine('isAsync', [true, false]).combineWithParams([
+      // Shader immediate size vs explicit layout size (kFixedLayoutSize)
+      { vertexShaderVsLayout: 'equal', fragmentShaderVsLayout: 'equal' },
+      { vertexShaderVsLayout: 'smaller', fragmentShaderVsLayout: 'smaller' },
+      { vertexShaderVsLayout: 'larger_small', fragmentShaderVsLayout: 'larger_small' },
+      { vertexShaderVsLayout: 'larger', fragmentShaderVsLayout: 'larger' },
+      // Shader immediate size vs device maxImmediateSize (auto layout) — vertex only
+      { vertexShaderVsLayout: 'atLimit', fragmentShaderVsLayout: 'none' },
+      { vertexShaderVsLayout: 'exceedLimit', fragmentShaderVsLayout: 'none' },
+      // Shader immediate size vs device maxImmediateSize (auto layout) — fragment only
+      { vertexShaderVsLayout: 'none', fragmentShaderVsLayout: 'atLimit' },
+      { vertexShaderVsLayout: 'none', fragmentShaderVsLayout: 'exceedLimit' },
+      // Shader immediate size vs device maxImmediateSize (auto layout) — both stages
+      { vertexShaderVsLayout: 'atLimit', fragmentShaderVsLayout: 'atLimit' },
+    ] as const)
+  )
+  .fn(t => {
+    t.skipIf(!supportsImmediateData(getGPU(t.rec)), 'Immediate data not supported');
+
+    const { isAsync, vertexShaderVsLayout, fragmentShaderVsLayout } = t.params;
+    const maxImmediateSize = t.device.limits.maxImmediateSize;
+    assert(maxImmediateSize !== undefined);
+
+    const resolvedVertexSize = resolveShaderSize(vertexShaderVsLayout, maxImmediateSize);
+    const resolvedFragmentSize = resolveShaderSize(fragmentShaderVsLayout, maxImmediateSize);
+
+    // Validate non-exceeding sizes fit within device limits.
+    if (vertexShaderVsLayout !== 'exceedLimit') {
+      assert(
+        resolvedVertexSize <= maxImmediateSize,
+        `vertex shader size (${resolvedVertexSize}) must be <= maxImmediateSize (${maxImmediateSize})`
+      );
+    }
+    if (fragmentShaderVsLayout !== 'exceedLimit') {
+      assert(
+        resolvedFragmentSize <= maxImmediateSize,
+        `fragment shader size (${resolvedFragmentSize}) must be <= maxImmediateSize (${maxImmediateSize})`
+      );
+    }
+
+    // Build pipeline layout.
+    let layout: GPUPipelineLayout | 'auto';
+    let validSize: number;
+
+    if (usesAutoLayout(vertexShaderVsLayout) || usesAutoLayout(fragmentShaderVsLayout)) {
+      layout = 'auto';
+      validSize = maxImmediateSize;
     } else {
-      const vertexCode = makeShaderCode(resolvedStageASize, 'vertex');
-      const fragmentCode = makeShaderCode(resolvedStageBSize, 'fragment');
-
-      vtu.doCreateRenderPipelineTest(t, isAsync, !shouldError, {
-        layout,
-        vertex: { module: t.device.createShaderModule({ code: vertexCode }) },
-        fragment: {
-          module: t.device.createShaderModule({ code: fragmentCode }),
-          targets: [{ format: 'rgba8unorm' }],
-        },
+      layout = t.device.createPipelineLayout({
+        bindGroupLayouts: [],
+        immediateSize: kFixedLayoutSize,
       });
+      validSize = kFixedLayoutSize;
     }
+
+    const vertexExceedsLimit = resolvedVertexSize > validSize;
+    const fragmentExceedsLimit = resolvedFragmentSize > validSize;
+    const shouldError = vertexExceedsLimit || fragmentExceedsLimit;
+
+    const vertexCode = makeShaderCode(resolvedVertexSize, 'vertex');
+    const fragmentCode = makeShaderCode(resolvedFragmentSize, 'fragment');
+
+    vtu.doCreateRenderPipelineTest(t, isAsync, !shouldError, {
+      layout,
+      vertex: { module: t.device.createShaderModule({ code: vertexCode }) },
+      fragment: {
+        module: t.device.createShaderModule({ code: fragmentCode }),
+        targets: [{ format: 'rgba8unorm' }],
+      },
+    });
   });
